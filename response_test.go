@@ -3,6 +3,7 @@ package typhon
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"io/ioutil"
@@ -11,9 +12,10 @@ import (
 	"testing"
 
 	"github.com/monzo/terrors"
-
+	"github.com/monzo/typhon/prototest"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
 )
 
 func TestResponseWriter(t *testing.T) {
@@ -140,6 +142,8 @@ func TestResponse_WrapDownstreamErrors(t *testing.T) {
 }
 
 func TestResponse_WrapDownstreamErrorsWithoutRequest(t *testing.T) {
+	t.Parallel()
+
 	// It's possible to create a Response without a Request.
 	// This test ensures that we don't panic when trying to read from the context.
 	err := terrors.NotFound("foo", "not found", nil)
@@ -176,6 +180,42 @@ func TestResponseDecodeJSON_TrailingSpace(t *testing.T) {
 	assert.NoError(t, rsp.Decode(&bout))
 	assert.Equal(t, map[string]string{
 		"foo": "bar"}, bout)
+}
+
+// TestResponseDecodeProtobuf verifies decoding of a protobuf message
+func TestResponseDecodeProtobuf(t *testing.T) {
+	t.Parallel()
+
+	g := &prototest.Greeting{
+		Message:  "Hello world!",
+		Priority: 1}
+	b, _ := proto.Marshal(g)
+	rsp := NewResponse(Request{})
+	rsp.Body = ioutil.NopCloser(bytes.NewReader(b))
+	rsp.Header.Set("Content-Type", "application/protobuf")
+
+	gout := &prototest.Greeting{}
+	assert.NoError(t, rsp.Decode(gout))
+	assert.Equal(t, "Hello world!", gout.Message)
+	assert.EqualValues(t, 1, gout.Priority)
+}
+
+// TestResponseDecodeProtobufWithAltType verifies decoding of a protobuf message
+func TestResponseDecodeProtobufWithAltType(t *testing.T) {
+	t.Parallel()
+
+	g := &prototest.Greeting{
+		Message:  "Hello world!",
+		Priority: 1}
+	b, _ := proto.Marshal(g)
+	rsp := NewResponse(Request{})
+	rsp.Body = ioutil.NopCloser(bytes.NewReader(b))
+	rsp.Header.Set("Content-Type", "application/x-protobuf")
+
+	gout := &prototest.Greeting{}
+	assert.NoError(t, rsp.Decode(gout))
+	assert.Equal(t, "Hello world!", gout.Message)
+	assert.EqualValues(t, 1, gout.Priority)
 }
 
 // rc is a helper type used in tests involving a generic io.ReadCloser
@@ -249,8 +289,13 @@ func (r jsonMarshalerReader) MarshalJSON() ([]byte, error) {
 	return []byte("{}"), nil
 }
 
+type protoMarshalerReader struct {
+	io.ReadCloser
+	*prototest.Greeting
+}
+
 // TestResponseEncodeReader verifies that passing an io.Reader to response.Encode() uses it properly as the body, and
-// does not attempt to encode it as JSON
+// does not attempt to encode it as JSON or Protobuf
 func TestResponseEncodeReader(t *testing.T) {
 	t.Parallel()
 
@@ -277,6 +322,7 @@ func TestResponseEncodeReader(t *testing.T) {
 	// an io.ReadCloser that happens to implement json.Marshaler should not be used directly and should be marshaled
 	jm := jsonMarshalerReader{
 		ReadCloser: ioutil.NopCloser(strings.NewReader("this should never see the light of day"))}
+	assert.Implements(t, (*json.Marshaler)(nil), jm)
 	rsp = Response{}
 	rsp.Encode(jm)
 	assert.Nil(t, rsp.Error)
@@ -285,4 +331,22 @@ func TestResponseEncodeReader(t *testing.T) {
 	body, err = ioutil.ReadAll(rsp.Body)
 	require.NoError(t, err)
 	assert.Equal(t, []byte("{}\n"), body)
+
+	// an io.ReadCloser that implements proto.Message should be marshaled
+	pm := &protoMarshalerReader{
+		ReadCloser: ioutil.NopCloser(strings.NewReader("this should never see the light of day")),
+		Greeting: &prototest.Greeting{
+			Message:  "hello",
+		},
+	}
+	assert.Implements(t, (*proto.Message)(nil), pm)
+	req := NewRequest(nil, "GET", "/", nil)
+	req.Header.Set("Accept", "application/protobuf")
+	rsp = Response{Request: &req}
+	rsp.Encode(pm)
+	assert.Nil(t, rsp.Error)
+	assert.Equal(t, "application/protobuf", rsp.Header.Get("Content-Type"))
+	body, err = ioutil.ReadAll(rsp.Body)
+	require.NoError(t, err)
+	assert.Subset(t, body, []byte("hello"), "'hello' should appear in the wire format")
 }

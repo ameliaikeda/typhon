@@ -10,6 +10,8 @@ import (
 	"strings"
 
 	"github.com/monzo/terrors"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
 )
 
 // A Request is Typhon's wrapper around http.Request, used by both clients and servers.
@@ -62,11 +64,50 @@ func (r *Request) Encode(v interface{}) {
 	r.Header.Set("Content-Type", "application/json")
 }
 
-// Decode de-serialises the JSON body into the passed object.
+// EncodeAsProtobuf serialises the passed object as protobuf into the body
+func (r *Request) EncodeAsProtobuf(m proto.Message) {
+	out, err := proto.Marshal(m)
+	if err != nil {
+		r.err = terrors.Wrap(err, nil)
+		return
+	}
+
+	n, err := r.Write(out)
+	if err != nil {
+		r.err = terrors.Wrap(err, nil)
+		return
+	}
+	r.Header.Set("Content-Type", "application/protobuf")
+	r.ContentLength = int64(n)
+}
+
+// Decode de-serialises the body into the passed object.
 func (r Request) Decode(v interface{}) error {
 	b, err := r.BodyBytes(true)
-	if err == nil {
-		err = json.Unmarshal(b, v)
+	if err != nil {
+		return terrors.WrapWithCode(err, nil, terrors.ErrBadRequest)
+	}
+
+	switch r.Header.Get("Content-Type") {
+	// application/x-protobuf is the "canonical" use, application/protobuf is defined in an expired IETF draft.
+	// See: https://datatracker.ietf.org/doc/html/draft-rfernando-protocol-buffers-00#section-3.2
+	// See: https://github.com/google/protorpc/blob/eb03145/python/protorpc/protobuf.py#L49-L51
+	case "application/octet-stream", "application/x-google-protobuf", "application/protobuf", "application/x-protobuf":
+		m, ok := v.(proto.Message)
+		if !ok {
+			return terrors.InternalService("invalid_type", "could not decode proto message", nil)
+		}
+		err = proto.Unmarshal(b, m)
+
+	// Proper JSON handling requires the protojson package in Go. application/jsonpb is a suggestion by grpc-gateway:
+	// https://github.com/grpc-ecosystem/grpc-gateway/blob/f4371f7/runtime/marshaler_registry.go#L89-L90
+	// This is a backward compatibility break for those using google.golang.org/protobuf/proto.Message incorrectly.
+	default:
+		if m, ok := v.(proto.Message); ok {
+			err = protojson.Unmarshal(b, m)
+		} else {
+			err = json.Unmarshal(b, v)
+		}
 	}
 	return terrors.WrapWithCode(err, nil, terrors.ErrBadRequest)
 }
